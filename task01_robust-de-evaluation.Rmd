@@ -1,0 +1,586 @@
+---
+title: "Robust Algorithm Evaluation for FinTech Decision-Making"
+author: "Mingyu Wang"
+subtitle: "Upgraded from SCEM coursework (Task I) to an industry-oriented project"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+
+```{r setup_seed, echo=FALSE, message=FALSE, warning=FALSE}
+## Reproducibility seed (kept from the original coursework; not a student identifier)
+CW_SEED <- 2708591L
+set.seed(CW_SEED)
+```
+
+*****
+
+## Portfolio note
+This file is an upgraded version of my original coursework submission. Assessment-only instructions were removed and the narrative was rewritten to reflect an industry-oriented mindset (robustness, decision relevance, and explicit assumptions). Core computations are preserved for reproducibility.
+
+
+## Executive summary
+This project evaluates multiple configurations of a Differential Evolution (DE) optimiser under two settings:
+(1) a single benchmark problem (pilot), and (2) a multi-problem blocked design (robustness check).
+
+Key outcome: the single-problem pilot selects one configuration as best, but the blocked multi-problem experiment changes the recommendation, illustrating why **robust strategy selection** matters in FinTech decision-making where conditions shift across regimes.
+
+```{r checkSeed, echo=FALSE}
+if(!is.numeric(CW_SEED)){
+  stop("CW_SEED must be a numeric value (used only as a reproducibility seed).")
+}
+```
+
+
+```{r setup_packages_and_inputs, echo=FALSE, message=FALSE, warning=FALSE}
+## Dependencies (no auto-install in portfolio projects)
+required_pkgs <- c("ggplot2", "dplyr", "tidyr", "knitr", "multcomp", "ExpDE")
+missing <- required_pkgs[!vapply(required_pkgs, requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)]
+if(length(missing) > 0){
+  stop("Missing packages: ", paste(missing, collapse = ", "),
+       ". Please install them before knitting.")
+}
+
+## Attach the packages used in the analysis
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(multcomp)
+library(ExpDE)
+
+## Experiment parameters and methods (kept compatible with the original coursework generator)
+exp_pars <- get_exp_params_1(CW_SEED)
+methods  <- gen_methods(CW_SEED)
+method.names <- vapply(methods, function(x) x$MethodName, character(1))
+
+## Single-problem benchmark used in the pilot (kept consistent with coursework)
+my.problem <- paste0("Prob.", CW_SEED, ".999")
+
+## Readability mapping (hide seed-looking method IDs in narrative/plots)
+method_map <- data.frame(
+  Method = method.names,
+  Config = paste0("Config ", LETTERS[seq_along(method.names)]),
+  stringsAsFactors = FALSE
+)
+method_label <- setNames(method_map$Config, method_map$Method)
+```
+
+
+
+## Upgrade log (from coursework → portfolio)
+- Renamed metadata to remove course-specific identifiers.
+- Rewrote explanations to emphasise decision-making under uncertainty (FinTech context).
+- Optimised data-generation code (preallocation) and added integrity checks.
+- Corrected the blocked analysis to use **problem-level cell means** (RCBD) to avoid pseudo-replication.
+- Expanded the independence discussion (design-driven), not just a bullet list.
+
+
+*****
+
+
+```{r artifacts_setup, echo=FALSE, message=FALSE, warning=FALSE}
+## Create output folders for GitHub artifacts
+if(!dir.exists("figures")) dir.create("figures", recursive = TRUE)
+if(!dir.exists("results")) dir.create("results", recursive = TRUE)
+```
+
+
+
+*****
+
+## Pilot Study: Single-Problem Evaluation
+
+
+
+### Hypotheses and evaluation objective
+
+**Null hypothesis (H₀).**  
+All Differential Evolution (DE) configurations have the same population mean log-loss  
+(\(\mu_1 = \cdots = \mu_K\)) on the target problem.
+
+**Alternative hypothesis (H₁).**  
+At least one configuration differs in population mean log-loss.
+
+To assess whether configuration choice materially affects expected performance, I apply a one-way ANOVA omnibus test. Each observation is generated from an independent algorithm run under a controlled evaluation protocol (fixed RNG seed, identical evaluation budgets across configurations). Under this design, observed performance differences can be attributed to configuration effects rather than experimental artefacts.
+
+*****
+
+### Experimental design and data generation
+
+
+```{r Q1_1_b}
+set.seed(CW_SEED) ## <--- DO NOT CHANGE THIS LINE
+
+# Generate nruns observations per method (preallocated for speed/reproducibility)
+nruns <- exp_pars$nruns
+M <- length(method.names)
+N <- nruns * M
+
+Method <- rep(method.names, each = nruns)
+Value  <- numeric(N)
+
+idx <- 0L
+for (mn in method.names) {
+  vals <- replicate(nruns, log(ExpDE2(method.name = mn, problem.name = my.problem)))
+  rng <- (idx + 1L):(idx + nruns)
+  Value[rng] <- vals
+  idx <- idx + nruns
+}
+
+myres <- data.frame(
+  Method = factor(Method, levels = method.names),
+  Config = factor(method_label[Method], levels = method_map$Config),
+  Value  = Value
+)
+
+stopifnot(nrow(myres) == N)
+head(myres)
+dim(myres)
+
+## myres has (nruns x number of methods) rows as required.
+```
+
+*****
+
+### Estimation and confidence intervals
+
+```{r Q1_1_c_ci}
+
+myCIs01 <- myres |>
+  dplyr::group_by(Method) |>
+  dplyr::summarise(
+    n    = dplyr::n(),
+    Mean = mean(Value),
+    sd   = stats::sd(Value),
+    se   = sd / sqrt(n),
+    tcrit = stats::qt(1 - exp_pars$alpha/2, df = n - 1),
+    CI.lower = Mean - tcrit * se,
+    CI.upper = Mean + tcrit * se,
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(Config = method_label[as.character(Method)]) |>
+  dplyr::select(Config, Method, Mean, CI.lower, CI.upper)
+
+myCIs01
+
+utils::write.csv(myCIs01, file = file.path('results','summary_single_problem_cis.csv'), row.names = FALSE)
+
+```
+
+```{r Q1_1_c_plot, fig.align='center'}
+p_ci <- ggplot2::ggplot(
+  myCIs01,
+  ggplot2::aes(y = reorder(Config, Mean), x = Mean, xmin = CI.lower, xmax = CI.upper)
+) +
+  ggplot2::geom_pointrange() +
+  ggplot2::labs(
+    y = "Configuration",
+    x = "Mean log-loss (t CI)",
+    title = "Pilot: mean log-loss and confidence intervals (single benchmark)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+
+p_ci
+ggplot2::ggsave(filename = file.path("figures","ci_single_problem.png"), width = 7, height = 3.8, dpi = 160)
+```
+
+
+*****
+
+### Omnibus statistical test
+
+```{r Q1_1_d_code}
+
+# ANOVA
+
+mytest01 <- aov(Value ~ Method, data = myres)
+
+summary(mytest01)
+
+
+## (DON'T FORGET THAT THE OBJECT RETURNED BY THE STATISTICAL TEST FUNCTION 
+## SHOULD BE STORED IN A VARIABLE CALLED mytest01).
+```
+
+
+The one-way ANOVA indicates statistically significant differences in mean log-loss across configurations. The p-value is far below the predefined significance level (α = 0.03), so I reject the null hypothesis of equal means. This implies at least one configuration performs differently on the pilot benchmark.
+
+*****
+
+### Model assumptions and diagnostics
+
+
+Assumptions and diagnostics. The ANOVA relies on (i) independent observations (separate algorithm runs under a fixed evaluation protocol), (ii) approximately normal residuals (helped by the log transform; checked with a QQ plot), and (iii) roughly constant variance across groups (checked via residual vs fitted and scale-location plots). The diagnostic plots below are used as sanity checks rather than proofs.
+
+
+
+```{r Q1_1_e_code, fig.align='center'}
+# Save diagnostics to figures/
+grDevices::png(filename = file.path("figures", "anova_diagnostics_single_problem.png"),
+               width = 1100, height = 800, res = 160)
+par(mfrow = c(2, 2))
+plot(mytest01, las = 1, pch = 20)
+dev.off()
+
+# Also show in the knitted report
+par(mfrow = c(2, 2))
+plot(mytest01, las = 1, pch = 20)
+par(mfrow = c(1, 1))
+```
+
+*****
+
+### Post-hoc comparisons
+
+```{r Q1_1_f_mcp}
+# Ensure Method is a factor and refit the omnibus ANOVA
+myres$Method <- factor(myres$Method, levels = method.names)
+
+mytest01 <- aov(Value ~ Method, data = myres)
+
+# Tukey post-hoc via multcomp
+myMHT1 <- glht(mytest01, linfct = mcp(Method = "Tukey"))
+summary(myMHT1)
+
+## myMHT1 stores the multiple comparisons object.
+```
+
+
+
+```{r Q1_1_f_ci}
+
+# Simultaneous CIs at your task's confidence level
+myCIs02 <- confint(myMHT1, level = 1 - exp_pars$alpha)
+myCIs02
+
+
+## (DON'T FORGET THAT YOUR OUTPUT OBJECT SHOULD BE STORED IN A VARIABLE CALLED 
+## myCIs02).
+```
+
+*****
+
+### Effect size and pairwise comparison of top configurations
+
+```{r Q1_1_g_best}
+# Best method based on point estimate of mean log-loss (smaller is better)
+ordered_methods <- myCIs01$Method[order(myCIs01$Mean)]
+
+# IMPORTANT BUGFIX:
+# myCIs01$Method is a factor, but relevel() expects ref to be a character (or valid level).
+best_method <- as.character(ordered_methods[1])
+second_best <- as.character(ordered_methods[2])
+
+best_method
+
+## (DON'T FORGET THAT THE *NAME* OF THE BEST METHOD BASED ON THE POINT ESTIMATE OF THE MEAN SHOULD BE STORED IN A VARIABLE CALLED best_method).
+```
+
+
+```{r Q1_1_g_topcomparison}
+# Extract Tukey CI table
+tukey_tbl <- as.data.frame(myCIs02$confint)
+tukey_tbl$Comparison <- rownames(tukey_tbl)
+
+# Tukey comparisons are labelled like "A - B" meaning (A minus B)
+comp1 <- paste0(best_method, " - ", second_best)
+comp2 <- paste0(second_best, " - ", best_method)
+
+row <- tukey_tbl[tukey_tbl$Comparison %in% c(comp1, comp2), ]
+stopifnot(nrow(row) == 1)
+
+# Standardise output as (best - second_best)
+if (row$Comparison == comp1) {
+  est <- row$Estimate
+  lwr <- row$lwr
+  upr <- row$upr
+} else {
+  est <- -row$Estimate
+  lwr <- -row$upr
+  upr <- -row$lwr
+}
+
+topComparison <- data.frame(
+  Method1   = best_method,
+  Method2   = second_best,
+  DiffMeans = est,
+  CI.lower  = lwr,
+  CI.upper  = upr
+)
+
+topComparison
+```
+
+
+```{r Q1_1_g_cohenD}
+# Use pooled residual variance from the omnibus ANOVA
+ms_resid <- summary(mytest01)[[1]]["Residuals", "Mean Sq"]
+sd_pooled <- sqrt(ms_resid)
+
+CohenD <- abs(topComparison$DiffMeans) / sd_pooled
+CohenD
+```
+
+
+Based on the point estimates, the best configuration (smallest mean log-loss) is **`r method_label[best_method]`**
+and the runner-up is **`r method_label[second_best]`**.
+
+The Tukey simultaneous confidence interval for the difference *(best − runner-up)* is
+`r sprintf("%.3f", topComparison$DiffMeans)` with a `r sprintf("%.0f%%", 100*(1-exp_pars$alpha))` CI
+[`r sprintf("%.3f", topComparison$CI.lower)`, `r sprintf("%.3f", topComparison$CI.upper)`].
+Since the interval does not include 0, the best configuration is statistically better at the predefined significance level.
+
+The observed standardised effect size is `r sprintf("%.2f", CohenD)`, exceeding the minimally relevant effect size
+$d^* = `r exp_pars$mres`$, indicating a practically meaningful improvement.
+
+
+
+*****
+*****
+
+## Robustness Check: Multi-Problem Blocked Evaluation
+
+### Motivation and blocked design
+
+To generalise beyond a single benchmark, I evaluate configurations across multiple problems. Because intrinsic problem difficulty can shift all methods up or down, I treat Problem as a blocking factor and compare methods after controlling for problem effects (RCBD / additive model).
+
+Null hypothesis (H₀). After accounting for problem difficulty, all configurations have the same mean log-loss (no method effect).
+Alternative hypothesis (H₁). At least one configuration differs in mean log-loss after accounting for problem difficulty.
+
+This corresponds to an RCBD / additive model: $y_{ij} = \\mu + \\tau_i + \\beta_j + \\varepsilon_{ij}$, where $\\tau_i$ is the method effect and $\\beta_j$ is the block (problem) effect.
+
+*****
+
+### Power and benchmark set size
+
+```{r Q1.2.b}
+# Inputs from experimental parameters
+alpha <- exp_pars$alpha
+d_star <- exp_pars$mres           # MRES corresponds to d*
+desired_power <- exp_pars$desired.power
+
+# fixed (all-vs-one, K = a - 1)
+if (!exists("method.names")) method.names <- names(methods)
+a <- length(method.names)
+K <- a - 1
+alpha_bonf <- alpha / K
+
+# Power calculations for paired t tests (block = problem)
+ss <- power.t.test(
+  type = "paired",
+  alternative = "two.sided",
+  delta = d_star,
+  sd = 1,
+  sig.level = alpha_bonf,
+  power = desired_power
+)
+
+# Required number of problems (rounded up)
+nprobs <- ceiling(ss$n)
+nprobs
+
+## (DON'T FORGET TO STORE YOUR RESULT AS A VARIABLE CALLED nprobs).
+```
+
+
+```{r gen_problems_portfolio, echo=FALSE, message=FALSE, warning=FALSE}
+## Generate the benchmark problem set for the robustness experiment
+problems <- gen_problems(CW_SEED, nprobs = nprobs, echo = FALSE)
+problem.names <- vapply(problems, function(x) x$ProblemName, character(1))
+problem.dimensions <- vapply(problems, function(x) length(x$xmax), integer(1))
+problem.types <- vapply(problems, function(x) x$name, character(1))
+```
+
+
+*****
+
+### Data generation across problems
+
+
+```{r Q1_2_c}
+set.seed(CW_SEED) 
+
+# Ensure required variables exist
+if (!exists("method.names")) method.names <- names(methods)
+
+# check ensures Q1.1.g was run
+if (!exists("best_method")) {
+  stop("ERROR: 'best_method' not found. Please run Q1.1.g first.")
+}
+# Check for the correct plural variable names
+stopifnot(exists("problem.names"), exists("problem.types"), exists("problem.dimensions"))
+
+# Parameters
+nruns <- exp_pars$nruns
+P     <- length(problem.names)
+M     <- length(method.names)
+N     <- P * M * nruns  # total number of observations
+
+# Add names to problem metadata for easy lookup
+names(problem.types)      <- problem.names
+names(problem.dimensions) <- problem.names
+
+# Preallocate empty vectors (much faster than rbind in loops)
+Method_vec            <- character(N)
+Problem_vec           <- character(N)
+Problem_type_vec      <- character(N)
+Problem_dimension_vec <- integer(N)
+Value_vec             <- numeric(N)
+
+# Use a running index to fill preallocated vectors
+idx <- 0L
+for (p in seq_len(P)) {
+  pn <- problem.names[p]
+  pt <- problem.types[[pn]]
+  pd <- problem.dimensions[[pn]]
+  for (m in seq_len(M)) {
+    mn <- method.names[m]
+    vals <- replicate(nruns, log(ExpDE2(method.name = mn, problem.name = pn)))
+
+    rng <- (idx + 1L):(idx + nruns)
+    Method_vec[rng]            <- mn
+    Problem_vec[rng]           <- pn
+    Value_vec[rng]             <- vals
+    Problem_type_vec[rng]      <- pt
+    Problem_dimension_vec[rng] <- pd
+
+    idx <- idx + nruns
+  }
+}
+
+# Combine into a single tidy dataframe
+myres2 <- data.frame(
+  Method            = factor(Method_vec, levels = method.names),
+  Config            = factor(method_label[Method_vec], levels = method_map$Config),
+  Problem           = factor(Problem_vec),
+  Problem_type      = factor(Problem_type_vec),
+  Problem_dimension = Problem_dimension_vec,
+  Value             = Value_vec,
+  check.names       = FALSE
+)
+
+# BUGFIX: ensure ref is character (relevel() is sensitive to factor ref)
+myres2$Method <- stats::relevel(myres2$Method, ref = as.character(best_method))
+
+# Basic integrity check
+stopifnot(nrow(myres2) == N)
+head(myres2); dim(myres2)
+
+## (DON'T FORGET THAT YOUR OBSERVATIONS SHOULD BE STORED IN A DATA FRAME CALLED 
+## myres2 WITH THE STRUCTURE DESCRIBED ABOVE).
+```
+
+
+### Blocked analysis on cell means (RCBD)
+
+```{r Q1_2_d_code}
+# Blocked analysis (RCBD) using **problem-level cell means**
+# Rationale: we have multiple runs per (Method, Problem) cell; averaging avoids pseudo-replication
+myres2_clean <- myres2[is.finite(myres2$Value), ]
+
+# Cell means (one mean per Method–Problem)
+cell_means <- aggregate(Value ~ Method + Problem, data = myres2_clean, FUN = mean)
+
+# Add readable config labels for plots/tables
+cell_means$Config <- factor(
+  method_label[as.character(cell_means$Method)],
+  levels = method_map$Config
+)
+
+# Save artifacts
+utils::write.csv(
+  cell_means,
+  file = file.path("results", "cell_means_multi_problem.csv"),
+  row.names = FALSE
+)
+
+# IMPORTANT: lock factor levels and Dunnett reference to the pilot winner
+cell_means$Method <- factor(cell_means$Method, levels = method.names)
+cell_means$Method <- stats::relevel(cell_means$Method, ref = as.character(best_method))
+
+# Two-way ANOVA with Problem as a blocking factor (RCBD)
+mytest02 <- aov(Value ~ Method + Problem, data = cell_means)
+
+summary(mytest02)
+```
+
+```{r Q1_2_d_plot, fig.align='center'}
+# Mean log-loss per configuration across problems (cell means)
+agg_cfg <- aggregate(Value ~ Config, data = cell_means, FUN = mean)
+agg_cfg <- agg_cfg[order(agg_cfg$Value), ]
+
+p_multi <- ggplot2::ggplot(agg_cfg, ggplot2::aes(x = Value, y = Config)) +
+  ggplot2::geom_point() +
+  ggplot2::labs(
+    x = "Mean log-loss (cell means)",
+    y = "Configuration",
+    title = "Average performance across problems (blocked design)"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+
+p_multi
+ggplot2::ggsave(filename = file.path("figures","mean_multi_problem.png"), width = 7, height = 3.2, dpi = 160)
+```
+
+
+
+I fit an RCBD-style ANOVA on problem-level cell means (averaging repeated runs per Method–Problem cell to avoid pseudo-replication) with Problem as a block. At α = 0.03, the Method p-value is far below α, so I reject equal method means after controlling for problem difficulty. The Problem term is also highly significant, confirming large variation across benchmarks and justifying blocking.
+
+*****
+
+### Dunnett comparisons vs pilot winner
+
+```{r Q1_2_e_mcp}
+myMHT2 <- glht(mytest02, linfct = mcp(Method = "Dunnett"))
+summary(myMHT2)
+
+## (DON'T FORGET THAT YOUR OUTPUT OBJECT SHOULD BE STORED IN A VARIABLE CALLED 
+## myMHT2).
+```
+
+
+
+```{r Q1_2_e_ci}
+myCIs03 <- confint(myMHT2, level = 1 - exp_pars$alpha)
+myCIs03
+
+## (DON'T FORGET THAT YOUR OUTPUT OBJECT SHOULD BE STORED IN A VARIABLE CALLED 
+## myCIs03).
+```
+
+*****
+
+### Decision recommendation
+
+:::{#Q1_2_f_txt .message style="color: black; border: 1px outset black; background-color: #eeeffe;"}
+After controlling for problem difficulty (treating Problem as a blocking factor), the blocked ANOVA provides strong evidence of a configuration (Method) effect, meaning average log-loss differs across DE configurations beyond what can be explained by benchmark difficulty alone.
+
+Using the pilot winner (**`r method_label[best_method]`**) as the reference, the Dunnett comparisons show that at least one alternative configuration achieves a materially lower mean log-loss. This is supported by a simultaneous **`r sprintf("%.0f%%", 100*(1-exp_pars$alpha))`** confidence interval that remains below zero for at least one comparison, indicating the improvement is not only statistically significant under multiple-comparison control, but also decision-relevant.
+
+
+Importantly, this result changes the recommendation relative to the single-problem pilot. In a FinTech-style setting where conditions can shift across regimes, selecting a strategy based on one benchmark can be unstable; the blocked multi-problem evaluation provides a more robust basis for a production recommendation.
+:::
+
+
+```{r 1_2_f_final}
+mm <- aggregate(Value ~ Method, cell_means, mean)
+mm <- mm[order(mm$Value), ]
+best_final <- as.character(mm$Method[1])
+best_final
+
+## (DON'T FORGET THAT THE NAME OF THE BEST METHOD SHOULD BE STORED AS VARIABLE
+## best_final).
+```
+
+*****
+*****
+
+## Limitations and next steps
+- Benchmarks are simulated optimisation problems; real FinTech environments may have non-stationarity, constraints, and asymmetric cost of errors.
+- Assumption checks (normality/variance) are diagnostics, not proofs; conclusions should be stress-tested.
+- Next steps: run a sensitivity analysis over evaluation budgets, expand the benchmark suite, and consider robustness checks (e.g., rank-based / nonparametric comparisons) when assumptions are questionable.

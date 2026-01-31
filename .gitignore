@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Teacher data / local outputs
+*.rds
+
+# Logs
+*.log
+
+# Render caches (optional)
+*_cache/
+*_files/
+figures/

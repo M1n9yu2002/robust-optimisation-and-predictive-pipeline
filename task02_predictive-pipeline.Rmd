@@ -1,0 +1,424 @@
+---
+title: "Predictive Pipeline for Robust Classification"
+subtitle: "Upgraded from SCEM Task II to an industry-oriented pipeline note"
+author: "Mingyu Wang"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r ID, echo=FALSE, message=FALSE, warning=FALSE}
+## We will use your student ID as the seed for the random number generator.
+MY_STUDENT_ID <- 2708591 # <-- Keep as a numeric ID (seed only).
+```
+
+```{r Setup, echo=FALSE, message=FALSE, warning=FALSE}
+force_reinstall_everything <- FALSE ## <--- change to TRUE to force a reinstall of 
+                                    ## all packages listed in allowed.packages
+
+## ADD ANY REQUIRED PACKAGES TO THE VECTOR BELOW
+## Note: tidyverse includes:  ggplot2, dplyr, tidyr, readr, purrr, tibble, 
+##                            stringr, forcats, and lubridate.
+allowed.packages <- c("tidyverse", 
+                      "tidymodels", 
+                      "recipes", 
+                      "parsnip", 
+                      "bonsai", 
+                      "themis",
+                      "healthyR.ai",
+                      "glmnet",
+                      "knitr")
+
+
+## DO NOT CHANGE ANYTHING ELSE IN THIS CODE BLOCK
+for (i in seq_along(allowed.packages)){
+  if(!(allowed.packages[i] %in% installed.packages()[, 1]) || force_reinstall_everything){
+    install.packages(allowed.packages[i], 
+                     dependencies = c("Depends", "Imports"),
+                     repos = "https://cloud.r-project.org")
+  }
+  library(allowed.packages[i], character.only = TRUE)
+}
+
+knitr::opts_chunk$set(echo = TRUE, collapse=TRUE)
+ignore <- runif(1) # To initialise the PRNG
+
+cat("\nList of allowed packages (pre-loaded):\n ", paste(allowed.packages, collapse="\n  "))
+```
+
+```{r checkID, echo=FALSE}
+if(!is.numeric(MY_STUDENT_ID)){
+  stop("MY_STUDENT_ID MUST BE YOUR VALID NUMERIC ID.")
+} 
+```
+
+*****
+
+## Portfolio note
+
+This file is an upgraded version of the original coursework submission. The core
+computations and the required chunk names are preserved for reproducibility, but
+the narrative is rewritten to read like a practical model-development note:
+decision-driven evaluation, leakage-aware splitting, and deployment realism.
+
+## Executive summary
+
+Goal: build a full predictive pipeline to classify samples into **Class** while
+handling (i) group dependence, (ii) high-dimensional correlated predictors, and
+(iii) mild class imbalance.
+
+Approach: use a **group-aware split** (by `Info_group`) to avoid leakage, then
+fit an end-to-end `tidymodels` workflow combining (a) imputation, (b)
+variance/encoding cleanup, (c) distribution stabilisation + scaling, (d)
+dimensionality reduction, and (e) regularised logistic regression (**Elastic
+Net**). Final assessment is performed once on the held-out test set. Deployment
+is simulated via predictions on an unlabeled holdout set.
+
+*****
+
+```{r load_data, echo = FALSE}
+## DO NOT CHANGE ANYTHING IN THIS CODE BLOCK
+set.seed(MY_STUDENT_ID)
+df <- readRDS("df.rds") %>% sample_frac(0.6, replace = FALSE)
+```
+
+*****
+
+## 1. Exploratory Data Analysis
+
+This EDA is intentionally lightweight: the goal is to surface the constraints
+that drive modelling choices (leakage risk, missingness, scale/skew, and
+imbalance), not to exhaustively profile every feature.
+
+```{r eda_basic_checks}
+# Target column for classification
+TARGET <- "Class"
+
+# Make the target a factor
+df[[TARGET]] <- as.factor(df[[TARGET]])
+
+# Quick structure check
+glimpse(df)
+
+# Missing values per column
+miss_df <- df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+miss_df %>% head(20)
+
+# Class distribution (imbalance check)
+df %>%
+  count(!!sym(TARGET)) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(desc(n))
+
+# Group sizes (leakage risk indicator)
+if ("Info_group" %in% names(df)) {
+  df %>%
+    count(Info_group) %>%
+    summarise(
+      n_groups = n(),
+      min_group_size = min(n),
+      median_group_size = median(n),
+      max_group_size = max(n)
+    )
+}
+```
+
+To understand scaling differences and tail behaviour (which can destabilise
+linear models), I summarise numeric columns and inspect the most variable ones.
+
+```{r eda_numeric_scale}
+# Keep only numeric features
+numeric_df <- df %>% select(where(is.numeric))
+
+# Compute median & SD for each numeric column
+summary_stats <- numeric_df %>%
+  summarise(across(everything(), list(median = median, sd = sd), .names = "{.col}_{.fn}")) %>%
+  pivot_longer(everything(),
+               names_to = c("feature", "stat"),
+               names_pattern = "(.*)_(.*)",
+               values_to = "value")
+
+# Scatterplot of median vs SD (scale differences)
+summary_stats %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  ggplot(aes(x = median, y = sd)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Median vs. Standard Deviation (numeric predictors)",
+       x = "Feature median",
+       y = "Feature SD")
+
+# 12 features with largest SD
+top_sd_features <- summary_stats %>%
+  filter(stat == "sd") %>%
+  arrange(desc(value)) %>%
+  slice_head(n = 12) %>%
+  pull(feature)
+
+# Histograms of these features (skew/outliers)
+df %>%
+  select(all_of(top_sd_features)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ feature, scales = "free") +
+  theme_minimal() +
+  ggtitle("Distributions of top 12 features by SD")
+```
+
+EDA takeaway (what this implies for the pipeline):
+
+- `Info_group` suggests a dependency structure → use **group-aware split/CV**.
+- Missing values are present → include **imputation** inside the workflow.
+- Numeric predictors show scale differences and skew → use **Yeo–Johnson + scaling**.
+- Predictors are numerous and correlated → prefer **regularisation and/or PCA**.
+- Class is mildly imbalanced → handle imbalance inside training only.
+
+*****
+
+## 2. Data preprocessing and feature engineering
+
+The key modelling risk is leakage: if samples from the same `Info_group` appear
+in both train and test, performance will be over-optimistic. Therefore, the test
+set is created using `group_initial_split()` and all transformations are placed
+inside a `recipe` so they are learned strictly from training data.
+
+```{r Preprocess}
+set.seed(MY_STUDENT_ID)
+
+# Ensure target is a factor
+df[[TARGET]] <- as.factor(df[[TARGET]])
+
+# Choose the minority class as the positive level (for F1/recall interpretation)
+tgt_counts <- df %>% count(!!sym(TARGET)) %>% arrange(n)
+pos_level  <- as.character(tgt_counts[[TARGET]][1])
+df[[TARGET]] <- forcats::fct_relevel(df[[TARGET]], pos_level)
+message("Positive class set to: ", pos_level)
+
+# --- Safety check: required grouping column must exist ---
+if (!("Info_group" %in% names(df))) {
+  stop("Required column 'Info_group' not found. Group-aware split/CV cannot proceed.")
+}
+
+# Train/test split by group to avoid leakage
+spl <- rsample::group_initial_split(df, group = Info_group, prop = 0.8)
+train_df <- training(spl)
+test_df  <- testing(spl)
+
+# ID / group columns (keep only those that actually exist)
+id_cols <- intersect(c("Info_PepID", "Info_pos", "Info_group"), names(train_df))
+
+# Drop Info_* columns except the IDs we keep
+info_cols <- grep("^Info_", names(train_df), value = TRUE)
+info_drop_cols <- setdiff(info_cols, id_cols)
+
+# Recipe: learned only on training data, applied consistently everywhere
+rec <- recipe(as.formula(paste(TARGET, "~ .")), data = train_df) %>%
+  update_role(all_of(id_cols), new_role = "id") %>%
+  step_rm(all_of(info_drop_cols)) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = 0.95) %>%
+  step_downsample(all_outcomes())
+
+# Preview processed training data and record PCA dimensionality
+prep_rec <- prep(rec)
+
+pca_idx <- which(sapply(prep_rec$steps, function(x) "step_pca" %in% class(x)))
+pca_step <- prep_rec$steps[[pca_idx]]
+n_components <- ncol(pca_step$res$rotation)
+cat(sprintf("PCA: retained ~95%% variance using %d components.\n", n_components))
+
+juice(prep_rec) %>% glimpse()
+
+# Report raw train/test balance (downsampling applies during workflow fit)
+train_df %>% count(!!sym(TARGET)) %>% mutate(pct = n/sum(n))
+test_df  %>% count(!!sym(TARGET)) %>% mutate(pct = n/sum(n))
+```
+
+What changed after preprocessing (conceptually):
+
+- Missing values are imputed (numeric median / categorical mode).
+- Nominal predictors are one-hot encoded so the model consumes numeric inputs.
+- Skew is reduced via Yeo–Johnson, then features are standardised.
+- PCA compresses correlated predictors, retaining ~95% variance.
+- Downsampling is applied **only to training** to reduce class imbalance impact.
+
+*****
+
+## 3. Modelling
+
+I start with a simple logistic regression baseline to validate that the pipeline
+runs end-to-end and to establish a reference. The final model is an **Elastic
+Net logistic regression** (`glmnet`), which is suitable for high-dimensional and
+correlated feature spaces (and remains stable after PCA).
+
+Hyperparameters:
+- `penalty` controls overall shrinkage.
+- `mixture` controls the balance between L1 (sparsity) and L2 (stability).
+
+To avoid leakage during tuning, I use **grouped v-fold CV** by `Info_group`.
+
+```{r Modelling}
+# Metrics for reporting (F1 prioritised due to imbalance)
+metric_fun <- yardstick::metric_set(accuracy, f_meas, precision, recall)
+
+# Baseline logistic regression (no tuning)
+baseline_spec <- logistic_reg(mode = "classification") %>%
+  set_engine("glm")
+
+baseline_wf <- workflow() %>%
+  add_model(baseline_spec) %>%
+  add_recipe(rec)
+
+set.seed(MY_STUDENT_ID)
+fit_baseline <- fit(baseline_wf, data = train_df)
+
+baseline_train_preds <- predict(fit_baseline, new_data = train_df, type = "class") %>%
+  bind_cols(predict(fit_baseline, new_data = train_df, type = "prob")) %>%
+  bind_cols(train_df %>% select(!!sym(TARGET)))
+
+cat("=== Baseline (training) ===\n")
+metric_fun(baseline_train_preds, truth = !!sym(TARGET), estimate = .pred_class, event_level = "first")
+
+# Grouped cross-validation folds
+set.seed(MY_STUDENT_ID)
+folds <- rsample::group_vfold_cv(train_df, group = Info_group, v = 5)
+
+# Tuned elastic-net logistic regression
+logit_tuned_spec <- logistic_reg(
+  mode    = "classification",
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet")
+
+wf_tuned <- workflow() %>%
+  add_model(logit_tuned_spec) %>%
+  add_recipe(rec)
+
+# Tuning grid
+logit_grid <- dials::grid_regular(
+  dials::penalty(range = c(-4, 0)),
+  dials::mixture(),
+  levels = 5
+)
+
+set.seed(MY_STUDENT_ID)
+logit_res <- tune::tune_grid(
+  wf_tuned,
+  resamples = folds,
+  grid      = logit_grid,
+  metrics   = yardstick::metric_set(f_meas, accuracy)
+)
+
+# Select best by mean CV F1 (exclude NA cases)
+best_results <- logit_res %>%
+  collect_metrics() %>%
+  filter(.metric == "f_meas", !is.na(mean)) %>%
+  arrange(desc(mean))
+
+best_logit <- best_results %>%
+  slice(1) %>%
+  select(penalty, mixture)
+
+cat("\n=== Best tuned hyperparameters (by CV F1) ===\n")
+print(best_logit)
+cat(sprintf("Best CV F1: %.3f\n", best_results$mean[1]))
+
+# Final workflow and fit
+final_wf <- finalize_workflow(wf_tuned, best_logit)
+
+set.seed(MY_STUDENT_ID)
+final_fit <- fit(final_wf, data = train_df)
+
+tuned_train_preds <- predict(final_fit, new_data = train_df, type = "class") %>%
+  bind_cols(predict(final_fit, new_data = train_df, type = "prob")) %>%
+  bind_cols(train_df %>% select(!!sym(TARGET)))
+
+cat("\n=== Final model (training) ===\n")
+metric_fun(tuned_train_preds, truth = !!sym(TARGET), estimate = .pred_class, event_level = "first")
+```
+
+Note on occasional NA F1 during tuning: some parameter combinations can yield
+degenerate predictions in a fold (e.g., predicting only one class), making
+precision/F1 undefined. These settings are not competitive and are excluded
+when selecting the best configuration.
+
+*****
+
+## 4. Assessment
+
+The held-out test set created earlier provides an unbiased estimate of
+generalisation performance (no tuning on it, no repeated peeking).
+
+```{r Assessment}
+test_preds <- predict(final_fit, new_data = test_df, type = "class") %>%
+  bind_cols(predict(final_fit, new_data = test_df, type = "prob")) %>%
+  bind_cols(test_df %>% select(!!sym(TARGET)))
+
+test_metrics <- metric_fun(
+  test_preds,
+  truth = !!sym(TARGET),
+  estimate = .pred_class,
+  event_level = "first"
+)
+
+test_metrics
+
+# Confusion matrix for context (optional but helpful)
+yardstick::conf_mat(test_preds, truth = !!sym(TARGET), estimate = .pred_class)
+```
+
+Test-set interpretation: the reported accuracy, precision, recall, and F1 reflect
+a single, final evaluation. In imbalanced settings, F1 and recall are often more
+informative than accuracy; the acceptable operating point depends on the cost of
+false positives vs false negatives in the intended application.
+
+*****
+
+## 5. Model deployment
+
+This section simulates deployment: generate predictions for an unlabeled holdout
+set and save them in the required format.
+
+```{r load_holdout, echo = FALSE}
+## DO NOT CHANGE ANYTHING IN THIS CODE BLOCK
+df_holdout <- readRDS("df_holdout.rds")
+```
+
+```{r deployment}
+# Predict classes for unseen holdout data
+holdout_pred_class <- predict(final_fit, new_data = df_holdout, type = "class")$.pred_class
+
+# Build submission dataframe
+stopifnot(all(c("Info_PepID", "Info_pos") %in% names(df_holdout)))
+
+mypreds <- tibble(
+  Info_PepID      = df_holdout$Info_PepID,
+  Info_pos        = df_holdout$Info_pos,
+  Predicted_class = holdout_pred_class
+)
+
+# Save predictions
+saveRDS(mypreds, "mypreds.rds")
+
+head(mypreds)
+```
+
+*****
+*****
+
+### =========== End ===========
+
