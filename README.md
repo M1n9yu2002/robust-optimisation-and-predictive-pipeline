@@ -22,3 +22,10 @@ Files:
 
 ## Notes
 - Large / sensitive files (e.g., `.rds`, `.RData`) are excluded via `.gitignore`.
+
+- ## Intended Audience
+This repository is intended as a portfolio for:
+- Data / Quantitative Analyst roles
+- Applied statistics or optimisation-focused MSc / PhD pathways
+- Recruiters looking for reproducible, decision-oriented modelling work
+
